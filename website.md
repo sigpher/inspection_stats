@@ -1,0 +1,13 @@
+https://amr.hunan.gov.cn/amr/ztx/ssjygkx/spcj/index.html
+https://scjg.hubei.gov.cn/bmdt/ztzl/cpzlanjg/zxcx_cpzlaqjg/spcjgg_spaqjg/
+https://amr.gd.gov.cn/zwgk/zdlyxxgk/cjjc/spcj/index.html
+https://scjgj.fujian.gov.cn/zw/zfjd/ccjc/
+http://scjdglj.gxzf.gov.cn/zwgk/fdzdgk/zdxx/spaq/
+https://amr.jiangxi.gov.cn/amr/spcjxx/index.html
+https://www.gz.gov.cn/zwgk/zdly/spypaq/zlxx/spzlxx/index.html
+https://amr.sz.gov.cn/xxgk/qt/ztlm/spaq/spaqjg/
+https://www.jiangmen.gov.cn/bmpd/jmsscjdglj/zwgk/zdlyxxgk/spypaqxxgk/aqjggzxx/
+https://www.zs.gov.cn/zjj/spypaqxxgk/zlxx/spzlxx/
+https://fsamr.foshan.gov.cn/zwgk/zdlyxxgk/spypaqxxgk/zlxx/spzlxx/
+http://scjgj.hechi.gov.cn/zwgk/fdzdgknr/zdlyxxgkspypaq/
+https://www.zhuhai.gov.cn/zw/shgysy/jbylws/spaq/

@@ -1,0 +1,16 @@
+[package]
+name = "inspection_stats"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+calamine = "0.30"
+cfb = "0.14.0"
+encoding_rs = "0.8"
+pdf-extract = "0.7"
+quick-xml = "0.37"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+zip = "2"
