@@ -21,6 +21,10 @@ const EMOJI_WARN: &str = "\u{26A0}\u{FE0F} "; // ⚠️
 const EMOJI_ERROR: &str = "\u{274C} "; // ❌
 const EMOJI_DEBUG: &str = "\u{1F50D} "; // 🔍
 const EMOJI_DONE: &str = "\u{2705} "; // ✅（用于 [完成]/[搜索] 等关键节点）
+const EMOJI_DOWNLOAD: &str = "\u{1F4E5} ";
+const EMOJI_OCR: &str = "\u{1F441} ";
+const EMOJI_SEARCH: &str = "\u{1F50D} ";
+const EMOJI_SKIP: &str = "\u{23ED}\u{FE0F} ";
 
 fn level_style(level: &str) -> (&'static str, &'static str) {
     match level {
@@ -30,6 +34,20 @@ fn level_style(level: &str) -> (&'static str, &'static str) {
         "DEBUG" => (EMOJI_DEBUG, CYAN),
         "DONE" => (EMOJI_DONE, BOLD),
         _ => ("", GREEN),
+    }
+}
+
+fn semantic_emoji(msg: &str) -> &'static str {
+    let tag = msg
+        .trim_start()
+        .strip_prefix('[')
+        .and_then(|r| r.find(']').map(|i| &r[..i]));
+    match tag {
+        Some("下载") => EMOJI_DOWNLOAD,
+        Some("OCR") => EMOJI_OCR,
+        Some("搜索") => EMOJI_SEARCH,
+        Some("跳过不合格") | Some("跳过") => EMOJI_SKIP,
+        _ => "",
     }
 }
 
@@ -68,18 +86,22 @@ pub fn log(level: &str, to_stderr: bool, msg: &str) {
     } else {
         io::stdout().is_terminal()
     };
+    let (emoji, color) = level_style(level);
+    let sem = semantic_emoji(msg);
     if tty {
-        let (emoji, color) = level_style(level);
-        let rendered = format!("{DIM}{ts}{RESET} {BOLD}{color}[{emoji}{level}]{RESET} {msg}");
+        let rendered = format!("{DIM}{ts}{RESET} {BOLD}{color}[{emoji}{level}]{RESET} {sem}{msg}");
         if to_stderr {
             eprintln!("{rendered}");
         } else {
             println!("{rendered}");
         }
-    } else if to_stderr {
-        eprintln!("{line}");
     } else {
-        println!("{line}");
+        let rendered = format!("{ts} [{emoji}{level}] {sem}{msg}");
+        if to_stderr {
+            eprintln!("{rendered}");
+        } else {
+            println!("{rendered}");
+        }
     }
 }
 

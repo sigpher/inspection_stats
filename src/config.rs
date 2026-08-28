@@ -46,6 +46,16 @@ pub fn umi_ocr_url() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:1224".to_string())
 }
 
+/// OCR 光栅化分辨率（DPI），默认 150。越低越快但精度略降；扫描件文字清晰时可调低提速。
+pub fn ocr_dpi() -> u32 {
+    let t = fs::read_to_string("config.toml").expect("无法读取 config.toml");
+    let re = Regex::new(r#"ocr_dpi\s*=\s*(\d{1,3})"#).unwrap();
+    re.captures(&t)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(150)
+}
+
 pub fn search_terms() -> Vec<String> {
     let t = fs::read_to_string("config.toml").expect("无法读取 config.toml");
     let re = Regex::new(r"(?s)search\s*=\s*\[(.*?)\]").unwrap();

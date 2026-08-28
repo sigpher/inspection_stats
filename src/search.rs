@@ -4,6 +4,8 @@
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use calamine::{Data, Reader, Xls, Xlsx};
 use quick_xml::Reader as XmlReader;
@@ -42,17 +44,22 @@ pub fn run(terms: &[String], dir: &Path, lang: &str) {
         info!("[搜索] {} 下没有可扫描的文件", dir.display());
         return;
     }
-    let mut hits: Vec<Hit> = Vec::new();
-    let mut scanned: Vec<Scanned> = Vec::new();
-    for f in &files {
-        debug!("[扫描] {}", f.display());
-        let r = scan_file(f, terms, lang);
-        scanned.push(Scanned {
-            file: f.display().to_string(),
-            broken: !r.ok,
-        });
-        hits.extend(r.hits);
-    }
+    let hits = Mutex::new(Vec::new());
+    let scanned = Mutex::new(Vec::new());
+    thread::scope(|s| {
+        for f in &files {
+            s.spawn(|| {
+                let r = scan_file(f, terms, lang);
+                scanned.lock().unwrap().push(Scanned {
+                    file: f.display().to_string(),
+                    broken: !r.ok,
+                });
+                hits.lock().unwrap().extend(r.hits);
+            });
+        }
+    });
+    let hits = hits.into_inner().unwrap();
+    let scanned = scanned.into_inner().unwrap();
     let folder = dir
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -79,7 +86,7 @@ struct Out {
 }
 
 fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
-    let bytes = match fs::read(path) {
+    let raw = match fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             error!("  [搜索] 读取失败 {}: {e}", path.display());
@@ -89,9 +96,10 @@ fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
             };
         }
     };
+    let bytes = Arc::new(raw);
     let fname = file_name(path);
     let fname = &fname;
-    let kind = kind_of(&bytes, path);
+    let kind = kind_of(bytes.as_slice(), path);
     let mut hits = Vec::new();
     let ok = match kind {
         Kind::Pdf => match pdf_text_or_ocr(path, &bytes, lang) {
@@ -137,7 +145,7 @@ fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
             }
         }
         Kind::Docx => {
-            let paras = docx_paragraphs(&bytes);
+            let paras = docx_paragraphs(&bytes[..]);
             match paras {
                 Ok(paras) => {
                     for term in terms {
@@ -161,7 +169,7 @@ fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
             }
         }
         Kind::DocBin => {
-            let text = docbin::doc_text(&bytes);
+            let text = docbin::doc_text(&bytes[..]);
             match text {
                 Some(text) => {
                     for term in terms {
@@ -187,7 +195,7 @@ fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
         }
         Kind::Other => {
             for term in terms {
-                let text = crate::http::decode_text(&bytes);
+                let text = crate::http::decode_text(&bytes[..]);
                 if let Some(snip) = snippet(&text, term) {
                     hits.push(Hit {
                         file: fname.clone(),
@@ -246,23 +254,32 @@ fn kind_of(bytes: &[u8], path: &Path) -> Kind {
 /// - None：TextBased / Mixed / 检测失败，先按文本提取，文本极少再回退 OCR。
 ///
 /// 检测在独立线程中带 30s 超时，避免畸形 PDF 卡死。
-fn pdf_needs_ocr(bytes: &[u8]) -> Option<bool> {
-    let owned = bytes.to_vec();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let r = pdf_inspector::detect_pdf_mem(&owned)
-            .ok()
-            .map(|info| matches!(info.pdf_type, PdfType::Scanned | PdfType::ImageBased));
-        let _ = tx.send(r);
+fn pdf_needs_ocr(bytes: &Arc<Vec<u8>>) -> Option<bool> {
+    let mut res = None;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            res = pdf_inspector::detect_pdf_mem(bytes.as_slice())
+                .ok()
+                .map(|info| matches!(info.pdf_type, PdfType::Scanned | PdfType::ImageBased));
+        });
     });
-    rx.recv_timeout(std::time::Duration::from_secs(30))
-        .unwrap_or_default()
+    res
 }
 
 /// 优先用 pdf-extract 取文本；pdf-inspector 判定为扫描件时直接 OCR；
 /// 文本提取失败或文本极少（图片型/混合）时回退到 OCR。
-fn pdf_text_or_ocr(path: &Path, bytes: &[u8], lang: &str) -> Result<Vec<String>, String> {
+fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>, lang: &str) -> Result<Vec<String>, String> {
     let force_ocr = pdf_needs_ocr(bytes);
+    if force_ocr == Some(true) {
+        info!("[OCR] {} 判定为扫描件，直接 OCR", path.display());
+        return match ocr::ocr_pdf(path, lang) {
+            Ok(op) if !pdf_text_sparse(&op) => Ok(op),
+            Ok(_) => Err(
+                "OCR 未识别出文本（可能缺少对应语言包，或页面纯为图片/空白）".to_string(),
+            ),
+            Err(e) => Err(e),
+        };
+    }
     match pdf_pages(bytes) {
         Ok(pages) => {
             let use_ocr = force_ocr.unwrap_or_else(|| pdf_text_sparse(&pages));
@@ -298,11 +315,11 @@ fn pdf_text_sparse(pages: &[String]) -> bool {
     total < 50
 }
 
-fn pdf_pages(bytes: &[u8]) -> Result<Vec<String>, String> {
+fn pdf_pages(bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let owned = bytes.to_vec();
+    let b = Arc::clone(bytes);
     std::thread::spawn(move || {
-        let _ = tx.send(pdf_extract::extract_text_from_mem_by_pages(&owned));
+        let _ = tx.send(pdf_extract::extract_text_from_mem_by_pages(b.as_slice()));
     });
     match rx.recv_timeout(std::time::Duration::from_secs(120)) {
         Ok(Ok(pages)) => Ok(pages),

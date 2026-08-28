@@ -4,10 +4,11 @@
 //! Umi-OCR 需在“全局设置”启用“开放API接口服务”（默认 http://127.0.0.1:1224）。
 //! 回退路径依赖系统已安装 poppler-utils（pdftoppm）与 tesseract-ocr（含对应语言包）。
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -19,9 +20,33 @@ use serde_json::Value;
 use crate::config;
 use crate::warn;
 
-const DPI: u32 = 200;
-const TIMEOUT: Duration = Duration::from_secs(600);
+static DPI: OnceLock<u32> = OnceLock::new();
+fn dpi() -> u32 {
+    *DPI.get_or_init(crate::config::ocr_dpi)
+}
 const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+const OCR_PAGE_CONCURRENCY: usize = 4;
+const OCR_MAX_CONCURRENCY: usize = 1;
+
+static OCR_SEM: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+fn ocr_sem() -> &'static (Mutex<usize>, Condvar) {
+    OCR_SEM.get_or_init(|| (Mutex::new(OCR_MAX_CONCURRENCY), Condvar::new()))
+}
+fn acquire_oci() {
+    let (m, c) = ocr_sem();
+    let mut g = m.lock().unwrap();
+    while *g == 0 {
+        g = c.wait(g).unwrap();
+    }
+    *g -= 1;
+}
+fn release_oci() {
+    let (m, c) = ocr_sem();
+    let mut g = m.lock().unwrap();
+    *g += 1;
+    c.notify_one();
+}
 
 static ENDPOINT: OnceLock<String> = OnceLock::new();
 fn endpoint() -> &'static str {
@@ -51,16 +76,21 @@ fn umi_ocr_available() -> bool {
 }
 
 fn umi_ocr_pdf(path: &Path) -> Result<Vec<String>, String> {
+    let (pngs, tmp) = rasterize(path, dpi())?;
+    let result = ocr_pages_umi(&pngs);
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
+fn rasterize(path: &Path, dpi: u32) -> Result<(Vec<(usize, PathBuf)>, PathBuf), String> {
     let tmp = unique_dir();
     fs::create_dir_all(&tmp).map_err(|e| format!("OCR 临时目录创建失败: {e}"))?;
     let prefix = tmp.join("p");
     let prefix_str = prefix.to_string_lossy().to_string();
-
-    // 1) 光栅化全部页为 PNG
     match Command::new("pdftoppm")
         .arg("-png")
         .arg("-r")
-        .arg(DPI.to_string())
+        .arg(dpi.to_string())
         .arg(path)
         .arg(&prefix_str)
         .output()
@@ -81,9 +111,7 @@ fn umi_ocr_pdf(path: &Path) -> Result<Vec<String>, String> {
             return Err(format!("pdftoppm 启动失败: {e}"));
         }
     }
-
-    // 2) 枚举生成的页面图像（p-1.png, p-2.png ...）
-    let mut pngs: Vec<(usize, std::path::PathBuf)> = Vec::new();
+    let mut pngs: Vec<(usize, PathBuf)> = Vec::new();
     if let Ok(rd) = fs::read_dir(&tmp) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
@@ -99,70 +127,95 @@ fn umi_ocr_pdf(path: &Path) -> Result<Vec<String>, String> {
         let _ = fs::remove_dir_all(&tmp);
         return Err("pdftoppm 未生成任何页面图像（可能不是有效 PDF）".to_string());
     }
+    Ok((pngs, tmp))
+}
 
-    // 3) 逐页 POST 到 Umi-OCR /api/ocr（base64 单图，data.format=text）
-    let (tx, rx) = mpsc::channel();
+fn ocr_pages_umi(pngs: &[(usize, PathBuf)]) -> Result<Vec<String>, String> {
+    let mut jobs: Vec<(usize, Vec<u8>)> = Vec::with_capacity(pngs.len());
+    for (n, p) in pngs {
+        match fs::read(p) {
+            Ok(b) => jobs.push((*n, b)),
+            Err(e) => return Err(format!("读取页面图像失败: {e}")),
+        }
+    }
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let queue = Arc::new(Mutex::new(jobs));
+    let (tx, rx) = mpsc::channel::<(usize, Result<String, String>)>();
     let ep = endpoint().to_string();
-    thread::spawn(move || {
-        let client = reqwest::blocking::Client::new();
-        let mut texts: Vec<String> = Vec::new();
-        let mut err: Option<String> = None;
-        for (_, p) in &pngs {
-            let bytes = match fs::read(p) {
-                Ok(b) => b,
-                Err(e) => {
-                    err = Some(format!("读取页面图像失败: {e}"));
-                    break;
-                }
-            };
-            let b64 = B64.encode(&bytes);
-            let body = serde_json::json!({
-                "base64": b64,
-                "options": { "data.format": "text", "ocr.language": "models/config_chinese.txt" }
-            });
-            let resp = match client
-                .post(format!("{ep}/api/ocr"))
-                .json(&body)
-                .timeout(PAGE_TIMEOUT)
-                .send()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    err = Some(format!("Umi-OCR 请求失败: {e}"));
-                    break;
-                }
-            };
-            let val: Value = match resp.json() {
-                Ok(v) => v,
-                Err(e) => {
-                    err = Some(format!("Umi-OCR 响应解析失败: {e}"));
-                    break;
-                }
-            };
-            match val.get("code").and_then(|c| c.as_i64()) {
-                Some(100) => {
-                    let t = val
-                        .get("data")
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    texts.push(t);
-                }
-                Some(101) => texts.push(String::new()), // 该页无文字
-                _ => {
-                    err = Some(format!("Umi-OCR 返回错误: {val}"));
-                    break;
+    let workers = OCR_PAGE_CONCURRENCY.min(queue.lock().unwrap().len());
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        let ep = ep.clone();
+        handles.push(thread::spawn(move || {
+            loop {
+                let job = { queue.lock().unwrap().pop() };
+                let Some((idx, bytes)) = job else { break };
+                let res = ocr_one_page_umi(&bytes, &ep);
+                let _ = tx.send((idx, res));
+            }
+        }));
+    }
+    drop(tx);
+    let mut ordered: Vec<(usize, String)> = Vec::new();
+    let mut first_err: Option<String> = None;
+    for (idx, res) in rx {
+        match res {
+            Ok(t) => ordered.push((idx, t)),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
                 }
             }
         }
-        let _ = tx.send(if let Some(e) = err { Err(e) } else { Ok(texts) });
-    });
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    ordered.sort_by_key(|(n, _)| *n);
+    Ok(ordered.into_iter().map(|(_, t)| t).collect())
+}
 
-    let result = rx
-        .recv_timeout(TIMEOUT)
-        .map_err(|_| format!("Umi-OCR 超时(>{:?})，可能为超大扫描件", TIMEOUT))??;
-    let _ = fs::remove_dir_all(&tmp);
-    Ok(result)
+fn ocr_one_page_umi(bytes: &[u8], ep: &str) -> Result<String, String> {
+    acquire_oci();
+    let res = (|| {
+        let b64 = B64.encode(bytes);
+        let body = serde_json::json!({
+            "base64": b64,
+            "options": { "data.format": "text", "ocr.language": "models/config_chinese.txt" }
+        });
+        let client = reqwest::blocking::Client::new();
+        let resp = match client
+            .post(format!("{ep}/api/ocr"))
+            .json(&body)
+            .timeout(PAGE_TIMEOUT)
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Umi-OCR 请求失败: {e}")),
+        };
+        let val: Value = match resp.json() {
+            Ok(v) => v,
+            Err(e) => return Err(format!("Umi-OCR 响应解析失败: {e}")),
+        };
+        match val.get("code").and_then(|c| c.as_i64()) {
+            Some(100) => Ok(val
+                .get("data")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string()),
+            Some(101) => Ok(String::new()),
+            _ => Err(format!("Umi-OCR 返回错误: {val}")),
+        }
+    })();
+    release_oci();
+    res
 }
 
 fn tesseract_ocr(path: &Path, lang: &str) -> Result<Vec<String>, String> {
@@ -171,96 +224,47 @@ fn tesseract_ocr(path: &Path, lang: &str) -> Result<Vec<String>, String> {
             "OCR 不可用：tesseract 未安装或语言包缺失（请安装 chi_sim / eng 等）".to_string(),
         );
     }
-    let tmp = unique_dir();
-    fs::create_dir_all(&tmp).map_err(|e| format!("OCR 临时目录创建失败: {e}"))?;
-    let prefix = tmp.join("p");
-    let prefix_str = prefix.to_string_lossy().to_string();
-    match Command::new("pdftoppm")
-        .arg("-png")
-        .arg("-r")
-        .arg(DPI.to_string())
-        .arg(path)
-        .arg(&prefix_str)
-        .output()
-    {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            let _ = fs::remove_dir_all(&tmp);
-            return Err(format!(
-                "pdftoppm 执行失败: {}",
-                String::from_utf8_lossy(&o.stderr)
-            ));
-        }
-        Err(e) => {
-            let _ = fs::remove_dir_all(&tmp);
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return Err("未找到 pdftoppm，请安装 poppler-utils".to_string());
+    let (pngs, tmp) = rasterize(path, dpi())?;
+    let mut texts: Vec<String> = Vec::with_capacity(pngs.len());
+    for (_, p) in &pngs {
+        match Command::new("tesseract")
+            .arg(p)
+            .arg("stdout")
+            .arg("-l")
+            .arg(lang)
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                texts.push(String::from_utf8_lossy(&o.stdout).to_string());
             }
-            return Err(format!("pdftoppm 启动失败: {e}"));
-        }
-    }
-
-    let mut pngs: Vec<(usize, std::path::PathBuf)> = Vec::new();
-    if let Ok(rd) = fs::read_dir(&tmp) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if let Some(stem) = name.strip_prefix("p-").and_then(|s| s.strip_suffix(".png"))
-                && let Ok(n) = stem.parse::<usize>()
-            {
-                pngs.push((n, e.path()));
+            Ok(o) => {
+                warn!(
+                    "[OCR] tesseract 单页识别失败: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                texts.push(String::new());
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    let _ = fs::remove_dir_all(&tmp);
+                    return Err("未找到 tesseract，请安装 tesseract-ocr".to_string());
+                }
+                warn!("[OCR] tesseract 启动失败: {e}");
+                texts.push(String::new());
             }
         }
     }
-    pngs.sort_by_key(|(n, _)| *n);
-    if pngs.is_empty() {
-        let _ = fs::remove_dir_all(&tmp);
-        return Err("pdftoppm 未生成任何页面图像（可能不是有效 PDF）".to_string());
-    }
-
-    let (tx, rx) = mpsc::channel();
-    let t_lang = lang.to_string();
-    thread::spawn(move || {
-        let mut texts: Vec<String> = Vec::new();
-        for (_, p) in &pngs {
-            match Command::new("tesseract")
-                .arg(p)
-                .arg("stdout")
-                .arg("-l")
-                .arg(&t_lang)
-                .stderr(Stdio::null())
-                .output()
-            {
-                Ok(o) if o.status.success() => {
-                    texts.push(String::from_utf8_lossy(&o.stdout).to_string());
-                }
-                Ok(o) => {
-                    warn!(
-                        "[OCR] tesseract 单页识别失败: {}",
-                        String::from_utf8_lossy(&o.stderr)
-                    );
-                    texts.push(String::new());
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        let _ = tx.send(Err("未找到 tesseract，请安装 tesseract-ocr".to_string()));
-                        return;
-                    }
-                    warn!("[OCR] tesseract 启动失败: {e}");
-                    texts.push(String::new());
-                }
-            }
-        }
-        let _ = tx.send(Ok(texts));
-    });
-
-    let result = rx
-        .recv_timeout(TIMEOUT)
-        .map_err(|_| format!("OCR 超时(>{:?})，可能为超大扫描件", TIMEOUT))?;
     let _ = fs::remove_dir_all(&tmp);
-    result
+    Ok(texts)
 }
 
 fn tesseract_has_lang(lang: &str) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(lang) {
+        return *v;
+    }
     let out = match Command::new("tesseract")
         .arg("--list-langs")
         .stderr(Stdio::null())
@@ -269,18 +273,21 @@ fn tesseract_has_lang(lang: &str) -> bool {
         Ok(o) => o,
         Err(_) => return false,
     };
-    if !out.status.success() {
-        return false;
-    }
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    lang.split('+').all(|l| {
-        let l = l.trim();
-        !l.is_empty() && text.lines().any(|line| line.trim() == l)
-    })
+    let ok = if !out.status.success() {
+        false
+    } else {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        lang.split('+').all(|l| {
+            let l = l.trim();
+            !l.is_empty() && text.lines().any(|line| line.trim() == l)
+        })
+    };
+    cache.lock().unwrap().insert(lang.to_string(), ok);
+    ok
 }
 
 fn unique_dir() -> std::path::PathBuf {
