@@ -1,3 +1,8 @@
 month = "08"
 
-search = ["天地壹号","天晨","巴马世界","道道全粮"]
+ocr_lang = "chi_sim+eng"
+
+# 本地 Umi-OCR 开放 API 地址（需启用“开放API接口服务”）。留默认即可，本机运行 Umi-OCR 时生效。
+umi_ocr_url = "http://127.0.0.1:1224"
+
+search = ["天地壹号","天晨","巴马世界"]

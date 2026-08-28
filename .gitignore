@@ -1,1 +1,13 @@
 /target
+config.toml
+result.db
+website.md
+*.pdf
+*.doc
+*.docx
+*.wps
+*.xlsx
+*.xls
+*.png
+*.jpg
+*.jpeg

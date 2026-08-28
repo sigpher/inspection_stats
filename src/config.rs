@@ -27,6 +27,25 @@ pub fn month_from_config() -> u32 {
         .unwrap_or_else(|| panic!("config.toml 中没有找到 month 配置"))
 }
 
+pub fn ocr_lang() -> String {
+    let t = fs::read_to_string("config.toml").expect("无法读取 config.toml");
+    let re = Regex::new(r#"ocr_lang\s*=\s*"([^"]*)""#).unwrap();
+    re.captures(&t)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "chi_sim+eng".to_string())
+}
+
+/// Umi-OCR 开放 API 地址（默认 http://127.0.0.1:1224）。需在 Umi-OCR“全局设置”启用“开放API接口服务”。
+pub fn umi_ocr_url() -> String {
+    let t = fs::read_to_string("config.toml").expect("无法读取 config.toml");
+    let re = Regex::new(r#"umi_ocr_url\s*=\s*"([^"]*)""#).unwrap();
+    re.captures(&t)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "http://127.0.0.1:1224".to_string())
+}
+
 pub fn search_terms() -> Vec<String> {
     let t = fs::read_to_string("config.toml").expect("无法读取 config.toml");
     let re = Regex::new(r"(?s)search\s*=\s*\[(.*?)\]").unwrap();
