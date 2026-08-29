@@ -78,6 +78,9 @@ pub fn run(terms: &[String], dir: &Path) {
         let n = hits.iter().filter(|h| &h.term == term).count();
         info!("[搜索] 「{term}」 命中 {n} 处");
     }
+    for h in &hits {
+        info!("[命中] {} | {} | 「{}」 | {}", h.file, h.loc, h.term, h.snippet);
+    }
 }
 
 struct Out {
@@ -434,14 +437,21 @@ fn snippet(text: &str, term: &str) -> Option<String> {
     let low_term = nterm.to_lowercase();
     let idx = low_text.find(&low_term)?;
     let c_idx = low_text[..idx].chars().count();
+    let term_len = low_term.chars().count();
     let c_total = low_text.chars().count();
-    let c_start = c_idx.saturating_sub(15);
-    let c_end = (c_idx + low_term.chars().count() + 20).min(c_total);
-    let mut s: String = ntext.chars().skip(c_start).take(c_end - c_start).collect();
-    if s.chars().count() > 60 {
-        s = s.chars().take(60).collect::<String>() + "…";
+    // 命中词前后各取一段上下文，拼接成约 200 字内的片段（仅两端截断时加省略号）。
+    let c_start = c_idx.saturating_sub(60);
+    let c_end = (c_idx + term_len + 120).min(c_total);
+    let s: String = ntext.chars().skip(c_start).take(c_end - c_start).collect();
+    let mut out = String::new();
+    if c_start > 0 {
+        out.push('…');
     }
-    Some(format!("“…{s}…”"))
+    out.push_str(&s);
+    if c_end < c_total {
+        out.push('…');
+    }
+    Some(out)
 }
 
 fn list_files(dir: &Path) -> Vec<PathBuf> {
