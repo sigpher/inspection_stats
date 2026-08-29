@@ -21,7 +21,7 @@ Rust scraper (edition 2024): crawls provincial/municipal AMR food-sampling-inspe
 - `time.rs` — civil-date math; all wall clocks (logs, 目标月份) are UTC+8 via `TZ_OFFSET_SECS` (换时区改这一处)
 
 ## Inputs (runtime config, never build artifacts)
-- `config.toml` — `month = "07"` selects target month (year from system clock); `search = [...]` drives `result.db`; `ocr_lang = "chi_sim+eng"` (optional, default `chi_sim+eng`) sets the tesseract language for scanned-PDF fallback; `umi_ocr_url = "http://127.0.0.1:1224"` (optional) points at the local Umi-OCR open API. Not Cargo config.
+- `config.toml` — `month = "07"` selects target month (year from system clock); `search = [...]` drives `result.db`; `ocr_lang = "chi_sim+eng"` (optional, default `chi_sim+eng`) sets the tesseract language for scanned-PDF fallback; `umi_ocr_urls = ["http://127.0.0.1:1224", ...]` (optional, single `umi_ocr_url` also accepted, default `http://127.0.0.1:1224`) lists local Umi-OCR open-API instances for load-balanced OCR — each entry must be an independently running Umi-OCR process on its own port; `ocr_dpi = 150` (optional, default 150) sets rasterization DPI. Not Cargo config.
 - `website.md` — one seed URL per line; runs in listed order. A new region needs BOTH a `website.md` line AND a `REGIONS` entry (src/config.rs), plus a dispatch branch in `crawl.rs` if its list page differs.
 
 ## Behavior

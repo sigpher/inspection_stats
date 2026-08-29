@@ -46,6 +46,28 @@ pub fn umi_ocr_url() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:1224".to_string())
 }
 
+/// 全部 Umi-OCR 实例地址（负载均衡用）。优先读 `umi_ocr_urls = ["...", "..."]`；
+/// 若未配置则退化为单个 `umi_ocr_url`（默认 http://127.0.0.1:1224）。
+pub fn umi_ocr_instances() -> Vec<String> {
+    let t = fs::read_to_string("config.toml").expect("无法读取 config.toml");
+    if let Some(c) = Regex::new(r"(?s)umi_ocr_urls\s*=\s*\[(.*?)\]").unwrap().captures(&t) {
+        let v: Vec<String> = c[1]
+            .split([',', '，', ';', '；'])
+            .map(|s| s.trim().trim_matches(['"', '\'', ' ']).to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let single = umi_ocr_url();
+    if single.is_empty() {
+        vec!["http://127.0.0.1:1224".to_string()]
+    } else {
+        vec![single]
+    }
+}
+
 /// OCR 光栅化分辨率（DPI），默认 150。越低越快但精度略降；扫描件文字清晰时可调低提速。
 pub fn ocr_dpi() -> u32 {
     let t = fs::read_to_string("config.toml").expect("无法读取 config.toml");
