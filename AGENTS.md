@@ -15,13 +15,13 @@ Rust scraper (edition 2024): crawls provincial/municipal AMR food-sampling-inspe
 - `html.rs` — URL absolutization, `<a>` extraction, date/title/期号 parsing, `classify()` 合格/不合格/mixed
 - `crawl.rs` — three site shapes: `crawl_jiangxi` (JSON API), `crawl_datepath` (湖南/福建 URL-date), `crawl_trs` (others)
 - `search.rs` — sniff magic bytes (not extensions), extract per format, build `result.db`. PDF 先用 `pdf-inspector` 判定 `PdfType`（TextBased/Scanned/ImageBased/Mixed）：Scanned/ImageBased 直接走 OCR；TextBased/Mixed 先 `pdf-extract` 取文本，文本极少再回退 OCR。
-- `ocr.rs` — 扫描件/图片型 PDF 回退：用系统 `pdftoppm` 光栅化每页，优先调本地 **Umi-OCR** HTTP API（`POST {umi_ocr_url}/api/ocr`，base64 单页，`data.format=text`）识别；Umi-OCR 不可用或失败时回退 `tesseract`（见下「OCR 依赖」）。仅在 pdf-extract 失败或文本极少时触发。
+- `ocr.rs` — 扫描件/图片型 PDF 识别：用系统 `pdftoppm` 光栅化每页，调本地 **Umi-OCR** HTTP API（`POST {umi_ocr_url}/api/ocr`，base64 单页，`data.format=text`）识别；支持多实例（`umi_ocr_urls`）空闲池负载均衡。Umi-OCR 全部不可用则该文件标记「无法解析」，无 tesseract 回退。仅在 pdf-extract 失败或文本极少时触发。
 - `docbin.rs` — legacy .doc via `cfb` crate (binary OLE); text only, no page layout
 - `log.rs` — dual logging: plain-text timestamped lines appended to `logs/{month}.log`; terminal (stdout/stderr) gets the same lines plus emoji + ANSI colors by level (TTY only, piped output stays plain). Macros `info!`/`done!`/`warn!`/`error!`/`debug!` (exported at crate root; `debug!` only active with `SW_DEBUG` env var). Logs live outside the download folder so search never scans them.
 - `time.rs` — civil-date math; all wall clocks (logs, 目标月份) are UTC+8 via `TZ_OFFSET_SECS` (换时区改这一处)
 
 ## Inputs (runtime config, never build artifacts)
-- `config.toml` — `month = "07"` selects target month (year from system clock); `search = [...]` drives `result.db`; `ocr_lang = "chi_sim+eng"` (optional, default `chi_sim+eng`) sets the tesseract language for scanned-PDF fallback; `umi_ocr_urls = ["http://127.0.0.1:1224", ...]` (optional, single `umi_ocr_url` also accepted, default `http://127.0.0.1:1224`) lists local Umi-OCR open-API instances for load-balanced OCR — each entry must be an independently running Umi-OCR process on its own port; `ocr_dpi = 150` (optional, default 150) sets rasterization DPI. Not Cargo config.
+- `config.toml` — `month = "07"` selects target month (year from system clock); `search = [...]` drives `result.db`; `umi_ocr_urls = ["http://127.0.0.1:1224", ...]` (optional, single `umi_ocr_url` also accepted, default `http://127.0.0.1:1224`) lists local Umi-OCR open-API instances for load-balanced OCR — each entry must be an independently running Umi-OCR process on its own port; `ocr_dpi = 150` (optional, default 150) sets rasterization DPI. Not Cargo config.
 - `website.md` — one seed URL per line; runs in listed order. A new region needs BOTH a `website.md` line AND a `REGIONS` entry (src/config.rs), plus a dispatch branch in `crawl.rs` if its list page differs.
 
 ## Behavior
@@ -41,5 +41,5 @@ Rust scraper (edition 2024): crawls provincial/municipal AMR food-sampling-inspe
 - Index pages are page-1 only (no pagination crawling); months older than the visible list need manual follow-up.
 - Big scanned/COM PDFs (广州-第5期.pdf, 134MB 福建 file) can exceed the per-file 120s extraction timeout — search.rs marks them 无法解析, result.db keeps the rest.
 - Calamine may fail on native-WPS `.xls` (BIFF with Chinese locale) → flagged in result 无法解析.
-- 扫描件/图片型 PDF：先用 `pdf-inspector` 判定类型，Scanned/ImageBased 直接走 OCR；其余先 `pdf-extract` 取文本，文本极少再回退 OCR（`ocr.rs`）。**优先用本地 Umi-OCR（开放 API，默认 `http://127.0.0.1:1224`，需在 Umi-OCR「全局设置」启用「开放API接口服务」）；Umi-OCR 不可用或失败时回退系统 `tesseract`**（需 `poppler-utils`(pdftoppm) 与 `tesseract-ocr`，且含所用语言包）。两种引擎任一成功即写入 result.db；均失败 → 该文件列为 无法解析，不会崩溃。
+- 扫描件/图片型 PDF：先用 `pdf-inspector` 判定类型，Scanned/ImageBased 直接走 OCR；其余先 `pdf-extract` 取文本，文本极少再回退 OCR（`ocr.rs`）。**只用本地 Umi-OCR（开放 API，默认 `http://127.0.0.1:1224`，需在 Umi-OCR「全局设置」启用「开放API接口服务」；可配 `umi_ocr_urls` 多实例负载均衡）**，光栅化依赖 `poppler-utils`(pdftoppm)。Umi-OCR 全部不可用 → 该文件列为 无法解析，不会崩溃（已移除 tesseract 回退）。
 - OCR 单个 PDF 整体限 600s，超时按 无法解析 处理；超大扫描件（如 134MB 福建 PDF）可能仍超时被跳过。OCR 期间每页生成临时 PNG 于系统临时目录，结束清理。

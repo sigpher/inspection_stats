@@ -31,7 +31,7 @@ struct Scanned {
     broken: bool,
 }
 
-pub fn run(terms: &[String], dir: &Path, lang: &str) {
+pub fn run(terms: &[String], dir: &Path) {
     let files = list_files(dir);
     debug!(
         "[扫描顺序] {:?}",
@@ -49,7 +49,7 @@ pub fn run(terms: &[String], dir: &Path, lang: &str) {
     thread::scope(|s| {
         for f in &files {
             s.spawn(|| {
-                let r = scan_file(f, terms, lang);
+                let r = scan_file(f, terms);
                 scanned.lock().unwrap().push(Scanned {
                     file: f.display().to_string(),
                     broken: !r.ok,
@@ -85,7 +85,7 @@ struct Out {
     hits: Vec<Hit>,
 }
 
-fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
+fn scan_file(path: &Path, terms: &[String]) -> Out {
     let raw = match fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -102,7 +102,7 @@ fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
     let kind = kind_of(bytes.as_slice(), path);
     let mut hits = Vec::new();
     let ok = match kind {
-        Kind::Pdf => match pdf_text_or_ocr(path, &bytes, lang) {
+        Kind::Pdf => match pdf_text_or_ocr(path, &bytes) {
             Ok(pages) => {
                 for term in terms {
                     for (i, page) in pages.iter().enumerate() {
@@ -268,14 +268,14 @@ fn pdf_needs_ocr(bytes: &Arc<Vec<u8>>) -> Option<bool> {
 
 /// 优先用 pdf-extract 取文本；pdf-inspector 判定为扫描件时直接 OCR；
 /// 文本提取失败或文本极少（图片型/混合）时回退到 OCR。
-fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>, lang: &str) -> Result<Vec<String>, String> {
+fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
     let force_ocr = pdf_needs_ocr(bytes);
     if force_ocr == Some(true) {
         info!("[OCR] {} 判定为扫描件，直接 OCR", path.display());
-        return match ocr::ocr_pdf(path, lang) {
+        return match ocr::ocr_pdf(path) {
             Ok(op) if !pdf_text_sparse(&op) => Ok(op),
             Ok(_) => Err(
-                "OCR 未识别出文本（可能缺少对应语言包，或页面纯为图片/空白）".to_string(),
+                "OCR 未识别出文本（Umi-OCR 可能未启用中文模型，或页面纯为图片/空白）".to_string(),
             ),
             Err(e) => Err(e),
         };
@@ -288,10 +288,10 @@ fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>, lang: &str) -> Result<Vec<
                     "[OCR] {} 判定需 OCR（扫描件/文本极少），尝试识别",
                     path.display()
                 );
-                match ocr::ocr_pdf(path, lang) {
+                match ocr::ocr_pdf(path) {
                     Ok(op) if !pdf_text_sparse(&op) => Ok(op),
                     Ok(_) => Err(
-                        "OCR 未识别出文本（可能缺少对应语言包，或页面纯为图片/空白）".to_string(),
+                        "OCR 未识别出文本（Umi-OCR 可能未启用中文模型，或页面纯为图片/空白）".to_string(),
                     ),
                     Err(e) => Err(e),
                 }
@@ -301,7 +301,7 @@ fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>, lang: &str) -> Result<Vec<
         }
         Err(e) => {
             info!("[OCR] {} 文本提取失败({e})，尝试 OCR", path.display());
-            ocr::ocr_pdf(path, lang)
+            ocr::ocr_pdf(path)
         }
     }
 }

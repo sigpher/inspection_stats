@@ -96,11 +96,10 @@ search = ["天地壹号", "天晨", "巴马世界"]   # 检索关键词，驱动
 
 检索 PDF 前先用 `pdf-inspector` 判定类型（`PdfType`）：`Scanned` / `ImageBased` 直接走 OCR；`TextBased` / `Mixed` 先用 `pdf-extract` 取文本，仅当文本极少时回退 OCR。OCR 流程：
 
-1. `pdftoppm` 把每页光栅化为临时 PNG（200 DPI，存于系统临时目录，结束清理）；
-2. **优先用本地 Umi-OCR 开放 API 识别**：逐页把 PNG 以 base64 POST 到 `{umi_ocr_url}/api/ocr`（`data.format=text`，中文模型 `models/config_chinese.txt`）；
-3. 若 Umi-OCR 不可用（未启动 / 未开启「开放API接口服务」）或某次请求失败，自动回退 **`tesseract`** 逐页识别（整体限 600s）。
+1. `pdftoppm` 把每页光栅化为临时 PNG（DPI 由 `config.toml` 的 `ocr_dpi` 控制，默认 150，存于系统临时目录，结束清理）；
+2. **用本地 Umi-OCR 开放 API 识别**：逐页把 PNG 以 base64 POST 到实例地址 `/api/ocr`（`data.format=text`，中文模型 `models/config_chinese.txt`）；支持 `umi_ocr_urls` 多实例负载均衡。
 
-前置依赖见 §1。两种引擎任一成功即写入 `result.db`；语言包缺失或超时会将该文件标记为 `无法解析`，不影响其余文件。OCR 回退语言由 `config.toml` 的 `ocr_lang` 控制（默认 `chi_sim+eng`）；若只装了 `chi_sim`，把该项改为 `"chi_sim"` 即可。Umi-OCR 地址由 `config.toml` 的 `umi_ocr_url` 指定（默认 `http://127.0.0.1:1224`）。
+前置依赖见 §1。Umi-OCR 任一实例成功即写入 `result.db`；若所有 Umi-OCR 实例均不可用，该文件标记为 `无法解析`，不影响其余文件（无 tesseract 回退）。Umi-OCR 实例地址由 `config.toml` 的 `umi_ocr_urls`（或单值 `umi_ocr_url`）指定，默认 `http://127.0.0.1:1224`。
 
 ---
 

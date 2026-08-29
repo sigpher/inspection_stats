@@ -23,13 +23,12 @@ async fn main() {
     log::init(&folder);
 
     let terms = config::search_terms();
-    let ocr_lang = config::ocr_lang();
     if std::env::args().any(|a| a == "--search") {
         if !dir.exists() {
             error!("{folder} 目录不存在，请先运行 cargo run 下载");
             std::process::exit(1);
         }
-        search::run(&terms, dir, &ocr_lang);
+        search::run(&terms, dir);
         return;
     }
 
@@ -88,6 +87,6 @@ async fn main() {
             "config.toml 未配置 search 词，跳过文件内容搜索（在 config.toml 中配置 search 后执行 cargo run -- --search）"
         );
     } else {
-        search::run(&terms, dir, &ocr_lang);
+        search::run(&terms, dir);
     }
 }

@@ -1,15 +1,15 @@
-//! 扫描件 / 图片型 PDF 的 OCR 解析：pdftoppm 光栅化每页，优先用本地 Umi-OCR（HTTP API）识别，
-//! 不可用时回退 tesseract。只在 search.rs 文本提取失败或文本极少时由 `pdf_text_or_ocr` 调用。
+//! 扫描件 / 图片型 PDF 的 OCR 解析：pdftoppm 光栅化每页，用本地 Umi-OCR（HTTP API）识别。
+//! 只在 search.rs 文本提取失败或文本极少时由 `pdf_text_or_ocr` 调用。
 //!
 //! Umi-OCR 需在“全局设置”启用“开放API接口服务”。支持多个实例（`config.toml` 的 `umi_ocr_urls`），
 //! 客户端用空闲实例池做负载均衡：每个实例同时只处理一个请求（Umi-OCR/Paddle 内部已多线程，
-//! 并发反而因 CPU 过度订阅而变慢），多实例之间真正并行。回退路径依赖系统已安装
-//! poppler-utils（pdftoppm）与 tesseract-ocr（含对应语言包）。
+//! 并发反而因 CPU 过度订阅而变慢），多实例之间真正并行。光栅化依赖系统已安装
+//! poppler-utils（pdftoppm）。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
@@ -101,15 +101,12 @@ fn umi_ocr_any_available() -> bool {
     m.lock().unwrap().alive.iter().any(|a| *a)
 }
 
-/// PDF 需要 OCR 时优先用 Umi-OCR（多实例负载均衡）；不可用或失败时回退 tesseract。
-pub fn ocr_pdf(path: &Path, lang: &str) -> Result<Vec<String>, String> {
-    if umi_ocr_any_available() {
-        match umi_ocr_pdf(path) {
-            Ok(t) => return Ok(t),
-            Err(e) => warn!("[OCR] Umi-OCR 失败({e})，回退 tesseract"),
-        }
+/// PDF 需要 OCR 时只用本地 Umi-OCR（多实例负载均衡）；全部实例不可用则该文件无法 OCR。
+pub fn ocr_pdf(path: &Path) -> Result<Vec<String>, String> {
+    if !umi_ocr_any_available() {
+        return Err("Umi-OCR 不可用，扫描件无法 OCR（未启用 tesseract 回退）".to_string());
     }
-    tesseract_ocr(path, lang)
+    umi_ocr_pdf(path)
 }
 
 fn umi_ocr_pdf(path: &Path) -> Result<Vec<String>, String> {
@@ -257,78 +254,6 @@ fn ocr_one_page_umi(bytes: &[u8], inst: usize) -> Result<String, String> {
         Some(101) => Ok(String::new()),
         _ => Err(format!("Umi-OCR 返回错误: {val}")),
     }
-}
-
-fn tesseract_ocr(path: &Path, lang: &str) -> Result<Vec<String>, String> {
-    if !tesseract_has_lang(lang) {
-        return Err(
-            "OCR 不可用：tesseract 未安装或语言包缺失（请安装 chi_sim / eng 等）".to_string(),
-        );
-    }
-    let (pngs, tmp) = rasterize(path, dpi())?;
-    let mut texts: Vec<String> = Vec::with_capacity(pngs.len());
-    for (_, p) in &pngs {
-        match Command::new("tesseract")
-            .arg(p)
-            .arg("stdout")
-            .arg("-l")
-            .arg(lang)
-            .stderr(Stdio::null())
-            .output()
-        {
-            Ok(o) if o.status.success() => {
-                texts.push(String::from_utf8_lossy(&o.stdout).to_string());
-            }
-            Ok(o) => {
-                warn!(
-                    "[OCR] tesseract 单页识别失败: {}",
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                texts.push(String::new());
-            }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    let _ = fs::remove_dir_all(&tmp);
-                    return Err("未找到 tesseract，请安装 tesseract-ocr".to_string());
-                }
-                warn!("[OCR] tesseract 启动失败: {e}");
-                texts.push(String::new());
-            }
-        }
-    }
-    let _ = fs::remove_dir_all(&tmp);
-    Ok(texts)
-}
-
-fn tesseract_has_lang(lang: &str) -> bool {
-    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(v) = cache.lock().unwrap().get(lang) {
-        return *v;
-    }
-    let out = match Command::new("tesseract")
-        .arg("--list-langs")
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    let ok = if !out.status.success() {
-        false
-    } else {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        lang.split('+').all(|l| {
-            let l = l.trim();
-            !l.is_empty() && text.lines().any(|line| line.trim() == l)
-        })
-    };
-    cache.lock().unwrap().insert(lang.to_string(), ok);
-    ok
 }
 
 fn unique_dir() -> std::path::PathBuf {

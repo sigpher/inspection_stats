@@ -1,7 +1,5 @@
 month = "08"
 
-ocr_lang = "chi_sim+eng"
-
 # 本地 Umi-OCR 开放 API 地址（需启用“开放API接口服务”）。可配置多个实例做负载均衡，
 # 程序会并发分配到不同实例，真正并行提速。每个实例对应一个独立的 Umi-OCR 进程/端口。
 umi_ocr_urls = [
