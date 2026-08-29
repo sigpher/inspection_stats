@@ -1,5 +1,5 @@
 //! 按 config.toml 的 search 词扫描下载目录，结果写入 result.db（SQLite）。
-//! 表格(xlsx/xls)→所在行；PDF→所在页；Word(doc/docx)→文本块/段落（无分页信息）。
+//! 表格(xlsx/xls)→所在行；文本型 PDF→所在页；OCR 型 PDF/doc/docx→全文/段落（无分页信息）。
 
 use std::fs;
 use std::io::{Cursor, Read};
@@ -79,7 +79,10 @@ pub fn run(terms: &[String], dir: &Path) {
         info!("[搜索] 「{term}」 命中 {n} 处");
     }
     for h in &hits {
-        info!("[命中] {} | {} | 「{}」 | {}", h.file, h.loc, h.term, h.snippet);
+        info!(
+            "[命中] {} | {} | 「{}」 | {}",
+            h.file, h.loc, h.term, h.snippet
+        );
     }
 }
 
@@ -106,7 +109,7 @@ fn scan_file(path: &Path, terms: &[String]) -> Out {
     let mut hits = Vec::new();
     let ok = match kind {
         Kind::Pdf => match pdf_text_or_ocr(path, &bytes) {
-            Ok(pages) => {
+            Ok(PdfText::Pages(pages)) => {
                 for term in terms {
                     for (i, page) in pages.iter().enumerate() {
                         if let Some(snip) = snippet(page, term) {
@@ -117,6 +120,19 @@ fn scan_file(path: &Path, terms: &[String]) -> Out {
                                 snippet: snip,
                             });
                         }
+                    }
+                }
+                true
+            }
+            Ok(PdfText::Whole(text)) => {
+                for term in terms {
+                    if let Some(snip) = snippet(&text, term) {
+                        hits.push(Hit {
+                            file: fname.clone(),
+                            term: term.clone(),
+                            loc: "全文".to_string(),
+                            snippet: snip,
+                        });
                     }
                 }
                 true
@@ -269,19 +285,19 @@ fn pdf_needs_ocr(bytes: &Arc<Vec<u8>>) -> Option<bool> {
     res
 }
 
+/// PDF 解析结果：分页文本（pdf-extract）或整篇文本（OCR，无分页信息）。
+enum PdfText {
+    Pages(Vec<String>),
+    Whole(String),
+}
+
 /// 优先用 pdf-extract 取文本；pdf-inspector 判定为扫描件时直接 OCR；
-/// 文本提取失败或文本极少（图片型/混合）时回退到 OCR。
-fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
+/// 文本提取失败或文本极少（图片型/混合）时回退到 OCR（mineru-open-api）。
+fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>) -> Result<PdfText, String> {
     let force_ocr = pdf_needs_ocr(bytes);
     if force_ocr == Some(true) {
         info!("[OCR] {} 判定为扫描件，直接 OCR", path.display());
-        return match ocr::ocr_pdf(path) {
-            Ok(op) if !pdf_text_sparse(&op) => Ok(op),
-            Ok(_) => Err(
-                "OCR 未识别出文本（Umi-OCR 可能未启用中文模型，或页面纯为图片/空白）".to_string(),
-            ),
-            Err(e) => Err(e),
-        };
+        return ocr_pdf_result(path);
     }
     match pdf_pages(bytes) {
         Ok(pages) => {
@@ -291,21 +307,26 @@ fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, Str
                     "[OCR] {} 判定需 OCR（扫描件/文本极少），尝试识别",
                     path.display()
                 );
-                match ocr::ocr_pdf(path) {
-                    Ok(op) if !pdf_text_sparse(&op) => Ok(op),
-                    Ok(_) => Err(
-                        "OCR 未识别出文本（Umi-OCR 可能未启用中文模型，或页面纯为图片/空白）".to_string(),
-                    ),
-                    Err(e) => Err(e),
-                }
+                ocr_pdf_result(path)
             } else {
-                Ok(pages)
+                Ok(PdfText::Pages(pages))
             }
         }
         Err(e) => {
             info!("[OCR] {} 文本提取失败({e})，尝试 OCR", path.display());
-            ocr::ocr_pdf(path)
+            ocr_pdf_result(path)
         }
+    }
+}
+
+/// 调 mineru-open-api OCR；结果过稀疏（识别失败/空）视为错误。
+fn ocr_pdf_result(path: &Path) -> Result<PdfText, String> {
+    match ocr::ocr_pdf(path) {
+        Ok(op) if !pdf_text_sparse(&op) => Ok(PdfText::Whole(op.join("\n"))),
+        Ok(_) => {
+            Err("OCR 未识别出文本（mineru-open-api 返回空，文件可能超限或纯图片）".to_string())
+        }
+        Err(e) => Err(e),
     }
 }
 

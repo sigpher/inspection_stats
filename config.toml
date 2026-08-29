@@ -1,19 +1,10 @@
 month = "08"
 
-# 本地 Umi-OCR 开放 API 地址（需启用“开放API接口服务”）。可配置多个实例做负载均衡，
-# 程序会并发分配到不同实例，真正并行提速。每个实例对应一个独立的 Umi-OCR 进程/端口。
-umi_ocr_urls = [
-  "http://127.0.0.1:1224",
-  "http://127.0.0.1:1225",
-  "http://127.0.0.1:1226",
-]
-
 # ── OCR / 提取可调参数（不写则用括号内默认值） ──
-ocr_dpi = 150                # 光栅化分辨率：越低越快（精度略降），120~200
-ocr_page_timeout = 60        # 单页 OCR 的 HTTP 请求超时（秒）
+# 扫描件/图片型 PDF 通过本地 mineru-open-api CLI（MinerU Open API 云端）OCR，
+# 需已安装并配置 token：`uv tool install mineru-open-api` + `mineru-open-api auth`
 ocr_pdf_timeout = 600        # 单个 PDF 整体 OCR 超时（秒），超时则该文件标“无法解析”
 pdf_extract_timeout = 120    # PDF 文本提取（pdf-extract）超时（秒）
-ocr_language = "models/config_chinese.txt"  # Umi-OCR 语言模型（API 的 ocr.language）
 sparse_threshold = 50        # PDF 非空白字符总数低于此值视为扫描件/图片型
 
 # ── 检索展示 ──

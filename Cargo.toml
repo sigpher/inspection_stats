@@ -10,10 +10,9 @@ encoding_rs = "0.8"
 pdf-extract = "0.7"
 quick-xml = "0.37"
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies", "json"] }
 rusqlite = "0.32"
 pdf-inspector = "1"
-base64 = "0.22"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 zip = "2"

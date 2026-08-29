@@ -7,8 +7,8 @@
 ## 1. 环境要求
 - **Rust 工具链**（edition 2024）。
 - 联网环境（爬取政府站点，13 地区，含个别上百 MB 文件，较慢）。
-- 扫描件识别依赖：本地 **Umi-OCR**（「全局设置」启用「开放API接口服务」，默认 `http://127.0.0.1:1224`）+ 系统 `poppler-utils`（`pdftoppm` 光栅化）。可配 `umi_ocr_urls` 多实例负载均衡。
-- 未启用 Umi-OCR 时，扫描件 / 图片型 PDF 标记 `无法解析`（不崩溃）。
+- 扫描件识别依赖：本地 **mineru-open-api** CLI（MinerU Open API 云端）。安装：`uv tool install mineru-open-api`，然后 `mineru-open-api auth` 配置 token（免费获取：https://mineru.net/apiManage/token）。
+- 未安装 / 未配 token 时，扫描件 / 图片型 PDF 标记 `无法解析`（不崩溃）。
 
 ## 2. 编译
 ```bash
@@ -23,12 +23,8 @@ cargo check                # 仅检查
 ```toml
 month = "08"                       # 目标月份（年份取系统时钟）
 search = ["天地壹号", "天晨"]       # 检索词，驱动 result.db
-# umi_ocr_urls = ["http://127.0.0.1:1224", "http://127.0.0.1:1225", "http://127.0.0.1:1226"]  # 可选：多实例负载均衡
-# ocr_dpi = 150                    # 光栅化 DPI（默认 150，越低越快）
-# ocr_page_timeout = 60            # 单页 OCR HTTP 超时（秒）
-# ocr_pdf_timeout = 600            # 单 PDF 整体 OCR 超时（秒），超时标“无法解析”
+# ocr_pdf_timeout = 600            # 单 PDF 整体 OCR 超时（秒，mineru-open-api 云端识别），超时标“无法解析”
 # pdf_extract_timeout = 120        # PDF 文本提取超时（秒）
-# ocr_language = "models/config_chinese.txt"  # Umi-OCR 语言模型
 # sparse_threshold = 50            # 低于此字符数视为扫描件/图片型
 # snippet_len = 180                # 命中上下文片段窗口（前 1/3、后 2/3）
 # tz_offset = 28800                # 时区偏移秒（东八区 +8h）
@@ -47,7 +43,7 @@ search = ["天地壹号", "天晨"]       # 检索词，驱动 result.db
 
 > 完整流程可能 10 分钟以上：13 个地区、政府站点慢、含个别上百 MB PDF。
 
-每次运行向 `logs/{month}.log` 追加时间戳日志；TTY 下带颜色与表情，管道为纯文本。调试日志需设 `SW_DEBUG`。
+每次运行向 `logs/{year}-{month}.log` 追加时间戳日志；TTY 下带颜色与表情，管道为纯文本。调试日志需设 `SW_DEBUG`。
 
 ## 5. 输出
 - `YYYY-MM/`：下载目录，文件名 `地区-第N期.ext`（期号取标题"第N期/第N号"，缺失回退发布日期或 `期数未知`）。跳过文件名含"不合格"的附件；重复运行重下载为 `地区-期-2.ext`（同目录 `-N` 去重）。彻底刷新请删除该目录。
@@ -59,17 +55,17 @@ search = ["天地壹号", "天晨"]       # 检索词，驱动 result.db
 > `.gitignore` 已忽略 `result.db` / `config.toml` / `website.md` / `/target`；`YYYY-MM/` 下载目录（常达数百 MB）**不忽略**，勿 `git add .` 误提交。
 
 ## 6. 检索定位与命中
-- 表格（xlsx / xls）→ `第N行`（含工作表名）；PDF → `第N页`；Word（doc / docx）→ `第N段` / 全文；其他文本 → `文本` / `全文`。
+- 表格（xlsx / xls）→ `第N行`（含工作表名）；PDF → 文本型 `第N页`、OCR 型 `全文`；Word（doc / docx）→ `第N段` / 全文；其他文本 → `文本` / `全文`。
 - 命中时终端逐条打印 `[命中] 文件 | 位置 | 词 | 片段`，并存入 `results` 表。混合内容或提取失败的文件标 `无法解析`，不会静默跳过。
 
 ## 7. 扫描件 / 图片型 PDF（OCR）
-PDF 先经 `pdf-inspector` 判定：`Scanned` / `ImageBased` 直接走 OCR；`TextBased` / `Mixed` 先 `pdf-extract` 取文本，文本极少再回退 OCR。OCR 流程：`pdftoppm` 每页光栅化为临时 PNG（DPI 由 `ocr_dpi` 控制，结束清理）→ 逐页以 base64 POST 到 Umi-OCR 实例 `/api/ocr`（`data.format=text`，中文模型 `models/config_chinese.txt`）。支持 `umi_ocr_urls` 多实例负载均衡；全部实例不可用则该文件 `无法解析`。
+PDF 先经 `pdf-inspector` 判定：`Scanned` / `ImageBased` 直接走 OCR；`TextBased` / `Mixed` 先 `pdf-extract` 取文本，文本极少再回退 OCR。OCR 调用本地 `mineru-open-api` CLI（MinerU Open API 云端，`extract --ocr` 输出 markdown），整篇识别、无分页信息，命中定位为 `全文`；文件超云端限制（200MB / 600 页）或未安装 / 未配 token / 超时则标 `无法解析`。文本型 PDF 仍按 `第N页` 定位。
 
 ## 8. 已知坑
 - 中文 GB2312 / GBK 页面：非 UTF-8 时回退 GB18030 解码（二进制 doc 同理）。
 - 湖南 https 握手卡死 → 自动 http 回退；湖北 HTTP 412 WAF → 0 文件；广西常延迟发布 → 新月份可能 0 条。
 - 列表页只抓第 1 页（不翻页）；更早月份需人工补采。
-- 超大扫描 / 复合 PDF（如 134MB 福建文件）可能超 120s 提取或 600s OCR 超时 → 标 `无法解析`。
+- 超大扫描 / 复合 PDF（如 134MB 福建文件）可能超 `ocr_pdf_timeout`（默认 600s，含云端上传耗时）→ 标 `无法解析`；可调大 `ocr_pdf_timeout`。
 - Calamine 可能解析不了原生 WPS 的 `.xls`（带中文区域位的 BIFF）→ 标 `无法解析`。
 
 ## 9. 典型工作流
