@@ -1,8 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 本地时区相对 UTC 的偏移秒数（东八区 = +8h）。换时区只改这里。
-pub const TZ_OFFSET_SECS: i64 = 8 * 3600;
-
+/// 本地时区相对 UTC 的偏移秒数（东八区 = +8h）。可在 config.toml 用 `tz_offset` 配置。
 fn epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -12,7 +10,7 @@ fn epoch_secs() -> i64 {
 
 /// 本地时区的当前秒数
 pub fn local_secs() -> i64 {
-    epoch_secs() + TZ_OFFSET_SECS
+    epoch_secs() + crate::config::tz_offset()
 }
 
 pub fn sys_now() -> i64 {

@@ -1,5 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static MAX_RETRIES: OnceLock<u32> = OnceLock::new();
+fn max_retries() -> u32 {
+    *MAX_RETRIES.get_or_init(crate::config::max_retries)
+}
+static RETRY_BACKOFF_BASE: OnceLock<u64> = OnceLock::new();
+fn retry_backoff_base() -> u64 {
+    *RETRY_BACKOFF_BASE.get_or_init(crate::config::retry_backoff_base)
+}
 
 /// 浏览器 UA 池，按请求轮换
 const UAS: [&str; 5] = [
@@ -64,7 +74,7 @@ pub async fn fetch_bytes_with(
 ) -> Result<Vec<u8>, String> {
     jitter_sleep(250, 700).await;
     let mut last = String::new();
-    for attempt in 0..3u32 {
+    for attempt in 0..max_retries() {
         for cand in [url.to_string(), http_fallback(url)] {
             let mut req = client
                 .get(&cand)
@@ -100,8 +110,8 @@ pub async fn fetch_bytes_with(
                 }
             }
         }
-        if attempt < 2 {
-            let backoff = 800u64 << attempt;
+        if attempt + 1 < max_retries() {
+            let backoff = retry_backoff_base() << attempt;
             jitter_sleep(backoff, backoff + 1500).await;
         }
     }

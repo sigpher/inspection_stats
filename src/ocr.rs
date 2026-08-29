@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -26,7 +26,18 @@ static DPI: OnceLock<u32> = OnceLock::new();
 fn dpi() -> u32 {
     *DPI.get_or_init(crate::config::ocr_dpi)
 }
-const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
+static PAGE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+fn page_timeout() -> Duration {
+    *PAGE_TIMEOUT.get_or_init(|| Duration::from_secs(config::ocr_page_timeout()))
+}
+static OCR_PDF_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+fn ocr_pdf_timeout() -> Duration {
+    *OCR_PDF_TIMEOUT.get_or_init(|| Duration::from_secs(config::ocr_pdf_timeout()))
+}
+static OCR_LANG: OnceLock<String> = OnceLock::new();
+fn ocr_lang() -> &'static str {
+    OCR_LANG.get_or_init(config::ocr_language)
+}
 
 /// 单 PDF 内并发识别的 worker 数（上限由实例数决定，多余的 worker 会阻塞在实例池上）。
 const OCR_PAGE_WORKERS: usize = 8;
@@ -182,12 +193,19 @@ fn ocr_pages_umi(pngs: &[(usize, PathBuf)]) -> Result<Vec<String>, String> {
     let next = AtomicUsize::new(0);
     let any_failed = AtomicBool::new(false);
     let workers = OCR_PAGE_WORKERS.min(n);
+    let deadline = Instant::now().checked_add(ocr_pdf_timeout());
     thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= n {
+                        break;
+                    }
+                    if let Some(d) = deadline
+                        && Instant::now() >= d
+                    {
+                        any_failed.store(true, Ordering::Relaxed);
                         break;
                     }
                     let (_, bytes) = &jobs[i];
@@ -229,13 +247,13 @@ fn ocr_one_page_umi(bytes: &[u8], inst: usize) -> Result<String, String> {
     let b64 = B64.encode(bytes);
     let body = serde_json::json!({
         "base64": b64,
-        "options": { "data.format": "text", "ocr.language": "models/config_chinese.txt" }
+        "options": { "data.format": "text", "ocr.language": ocr_lang() }
     });
     let client = reqwest::blocking::Client::new();
     let resp = match client
         .post(format!("{ep}/api/ocr"))
         .json(&body)
-        .timeout(PAGE_TIMEOUT)
+        .timeout(page_timeout())
         .send()
     {
         Ok(r) => r,

@@ -48,7 +48,7 @@ async fn main() {
 
     let client = reqwest::Client::builder()
         .user_agent(UA)
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(config::http_timeout()))
         .cookie_store(true)
         .default_headers(headers)
         .build()

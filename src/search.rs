@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use calamine::{Data, Reader, Xls, Xlsx};
@@ -309,13 +309,18 @@ fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, Str
     }
 }
 
+static SPARSE_THRESHOLD: OnceLock<usize> = OnceLock::new();
+fn sparse_threshold() -> usize {
+    *SPARSE_THRESHOLD.get_or_init(crate::config::sparse_threshold)
+}
+
 /// 所有页非空白字符总数低于阈值，视为扫描件/图片型 PDF。
 fn pdf_text_sparse(pages: &[String]) -> bool {
     let total: usize = pages
         .iter()
         .map(|p| p.chars().filter(|c| !c.is_whitespace()).count())
         .sum();
-    total < 50
+    total < sparse_threshold()
 }
 
 fn pdf_pages(bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
@@ -324,10 +329,11 @@ fn pdf_pages(bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
     std::thread::spawn(move || {
         let _ = tx.send(pdf_extract::extract_text_from_mem_by_pages(b.as_slice()));
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+    let to = crate::config::pdf_extract_timeout();
+    match rx.recv_timeout(std::time::Duration::from_secs(to)) {
         Ok(Ok(pages)) => Ok(pages),
         Ok(Err(e)) => Err(format!("PDF 文本提取失败: {e}")),
-        Err(_) => Err("PDF 文本提取超时(>120s, 可能为超大/扫描型文件)".to_string()),
+        Err(_) => Err(format!("PDF 文本提取超时(>{to}s, 可能为超大/扫描型文件)")),
     }
 }
 
@@ -428,6 +434,11 @@ fn docx_paragraphs(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(paras)
 }
 
+static SNIPPET_LEN: OnceLock<usize> = OnceLock::new();
+fn snippet_len() -> usize {
+    *SNIPPET_LEN.get_or_init(crate::config::snippet_len)
+}
+
 fn snippet(text: &str, term: &str) -> Option<String> {
     // OCR 输出常在汉字间插入空格（如“天 地 壹 号”），且英文可能有空格；
     // 检索时去掉两端空白再匹配，避免扫描件漏检。
@@ -439,9 +450,12 @@ fn snippet(text: &str, term: &str) -> Option<String> {
     let c_idx = low_text[..idx].chars().count();
     let term_len = low_term.chars().count();
     let c_total = low_text.chars().count();
-    // 命中词前后各取一段上下文，拼接成约 200 字内的片段（仅两端截断时加省略号）。
-    let c_start = c_idx.saturating_sub(60);
-    let c_end = (c_idx + term_len + 120).min(c_total);
+    // 命中词前后各取一段上下文，拼接成约 len 字内的片段（仅两端截断时加省略号）。
+    let len = snippet_len();
+    let before = len / 3;
+    let after = len.saturating_sub(before);
+    let c_start = c_idx.saturating_sub(before);
+    let c_end = (c_idx + term_len + after).min(c_total);
     let s: String = ntext.chars().skip(c_start).take(c_end - c_start).collect();
     let mut out = String::new();
     if c_start > 0 {
