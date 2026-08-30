@@ -14,9 +14,9 @@ Rust scraper (edition 2024): crawls provincial/municipal AMR food-sampling-inspe
 - `http.rs` — async `reqwest` (rustls, HTTP/1.1, cookie store) with 3 retries (exponential backoff + jitter), 120s timeout, https→http fallback, UTF-8→GB18030 decode, per-request UA rotation, browser Accept/Accept-Language headers, optional Referer (anti-hotlink), random pre-request jitter (built-in splitmix64, no external rand crate)
 - `html.rs` — URL absolutization, `<a>` extraction, date/title/期号 parsing, `classify()` 合格/不合格/mixed
 - `crawl.rs` — three site shapes: `crawl_jiangxi` (JSON API), `crawl_datepath` (湖南/福建 URL-date), `crawl_trs` (others)
-- `search.rs` — sniff magic bytes (not extensions), extract per format, build `result.db`. PDF 先用 `pdf-inspector` 判定 `PdfType`（TextBased/Scanned/ImageBased/Mixed）：Scanned/ImageBased 直接走 OCR；TextBased/Mixed 先 `pdf-extract` 取文本，文本极少再回退 OCR。
+- `search.rs` — sniff magic bytes (not extensions), extract per format, build `result.db`. PDF 先用 `pdf-inspector` 判定 `PdfType`（TextBased/Scanned/ImageBased/Mixed）：Scanned/ImageBased 直接走 OCR；TextBased/Mixed 先 `pdf-extract` 取文本，文本极少再回退 OCR。Word(doc/docx) 用系统 `soffice`（LibreOffice，`word_pages`）转 PDF 按页定位 `第N页`；soffice 缺失/转换失败时回退 `第N段`（docx 段落 / doc 干净文本块）。
 - `ocr.rs` — 扫描件/图片型 PDF 回退：用系统 `pdftoppm` 光栅化每页，优先调本地 **Umi-OCR** HTTP API（`POST {umi_ocr_url}/api/ocr`，base64 单页，`data.format=text`）识别；Umi-OCR 不可用或失败时回退 `tesseract`（见下「OCR 依赖」）。仅在 pdf-extract 失败或文本极少时触发。
-- `docbin.rs` — legacy .doc via `cfb` crate (binary OLE); text only, no page layout
+- `docbin.rs` — legacy .doc / WPS 原生 .xls（OLE 复合文档）via `cfb` crate：读 WordDocument/Workbook/Book 流，GB18030 + UTF-16LE 双字节对齐解码（正文/SST 可能奇对齐），文本块下限 2 个汉字（太低出乱码、太高会漏掉短关键词）；text only, no page layout
 - `log.rs` — dual logging: plain-text timestamped lines appended to `logs/{month}.log`; terminal (stdout/stderr) gets the same lines plus emoji + ANSI colors by level (TTY only, piped output stays plain). Macros `info!`/`done!`/`warn!`/`error!`/`debug!` (exported at crate root; `debug!` only active with `SW_DEBUG` env var). Logs live outside the download folder so search never scans them.
 - `time.rs` — civil-date math; all wall clocks (logs, 目标月份) are UTC+8 via `TZ_OFFSET_SECS` (换时区改这一处)
 
@@ -28,7 +28,7 @@ Rust scraper (edition 2024): crawls provincial/municipal AMR food-sampling-inspe
 - Skips attachments whose name contains 不合格; downloads 合格-labeled files and single combined result tables (明细表/汇总表/通告.pdf) since most regions publish one file with both rows. Support docs (本次检验项目, 说明) are skipped. `classify` rules in `html.rs` — aligned to the label text, not the file.
 - Filename `地区-第N期.ext` (from title 第N期/第N号); falls back to publish date (`ZJ-20260729.xlsx`) or `期数未知`.
 - Re-runs re-download into `地区-期-2.ext` (dedupe is `-N` per folder, never skip). Delete the output folder for a clean refresh.
-- `search` locations: spreadsheets → `第N行` (row index), PDF → `第N页`, Word/docs → text block/paragraph (docs have no layout-driven page numbers). Mixed/extraction failures are listed as 无法解析; unparseable formats are reported honestly, not skipped silently.
+- `search` locations: spreadsheets → `第N行` (row index), PDF → `第N页`, Word(doc/docx) → `第N页`（`word_pages` 用 LibreOffice 转 PDF 按页定位；soffice 缺失/转换失败时回退 docx → `第N段`、旧版 .doc → `第N段`（按 docbin 提取的“干净文本块”编号，跳过 FIB 头/二进制区的乱码块；定位不到的短块退化为 全文）). Mixed/extraction failures are listed as 无法解析; unparseable formats are reported honestly, not skipped silently.
 
 ## Git hygiene
 - `.gitignore` excludes `/target`、生成输出 `result.db`、`config.toml`、`website.md`。运行产生的 `YYYY-MM/` 下载目录（常达数百 MB，如 134MB 福建 PDF）不在忽略列表 —— 切勿 `git add .` 误提交下载附件。
@@ -40,6 +40,7 @@ Rust scraper (edition 2024): crawls provincial/municipal AMR food-sampling-inspe
 - 广西 publishes on a delay → fresh month may legitimately have 0 items.
 - Index pages are page-1 only (no pagination crawling); months older than the visible list need manual follow-up.
 - Big scanned/COM PDFs (广州-第5期.pdf, 134MB 福建 file) can exceed the per-file 120s extraction timeout — search.rs marks them 无法解析, result.db keeps the rest.
-- Calamine may fail on native-WPS `.xls` (BIFF with Chinese locale) → flagged in result 无法解析.
+- Word(doc/docx) 页码依赖系统 `soffice`（LibreOffice）转 PDF 定位（每文件多花约 1~20s，每个转换独立临时 profile 防并行互锁）；soffice 缺失时自动回退 `第N段`。LibreOffice 与 Word/WPS 排版可能有 1 页左右的差异（字体/页边距不同），页码是近似值。
+- Calamine may fail on native-WPS `.xls` (BIFF with Chinese locale) → search.rs 回退 `docbin::cfb_text` 按 OLE 流提取文本（loc=全文）；两种都失败才标 无法解析.
 - 扫描件/图片型 PDF：先用 `pdf-inspector` 判定类型，Scanned/ImageBased 直接走 OCR；其余先 `pdf-extract` 取文本，文本极少再回退 OCR（`ocr.rs`）。**优先用本地 Umi-OCR（开放 API，默认 `http://127.0.0.1:1224`，需在 Umi-OCR「全局设置」启用「开放API接口服务」）；Umi-OCR 不可用或失败时回退系统 `tesseract`**（需 `poppler-utils`(pdftoppm) 与 `tesseract-ocr`，且含所用语言包）。两种引擎任一成功即写入 result.db；均失败 → 该文件列为 无法解析，不会崩溃。
 - OCR 单个 PDF 整体限 600s，超时按 无法解析 处理；超大扫描件（如 134MB 福建 PDF）可能仍超时被跳过。OCR 期间每页生成临时 PNG 于系统临时目录，结束清理。

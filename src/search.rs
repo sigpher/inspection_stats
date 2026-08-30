@@ -1,5 +1,6 @@
 //! 按 config.toml 的 search 词扫描下载目录，结果写入 result.db（SQLite）。
-//! 表格(xlsx/xls)→所在行；PDF→所在页；Word(doc/docx)→文本块/段落（无分页信息）。
+//! 表格(xlsx/xls)→所在行；PDF→所在页；Word(doc/docx)→LibreOffice 转 PDF 后的页码
+//! （soffice 不可用或转换失败时退化为 段落/文本块 定位）。
 
 use std::fs;
 use std::io::{Cursor, Read};
@@ -141,25 +142,45 @@ fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
                     }
                     true
                 }
-                None => false,
+                None => {
+                    // WPS 原生 .xls 等 calamine 打不开时，退回 OLE 流的文本提取，
+                    // 避免整份表格静默漏检（找到文本即视为成功）。
+                    match docbin::cfb_blocks(&bytes[..]) {
+                        Some(blocks) => {
+                            hits.extend(hits_in_blocks(&blocks, fname, terms));
+                            true
+                        }
+                        None => {
+                            error!(
+                                "  [搜索] 表格解析失败 {}: calamine 与 OLE 文本提取均失败",
+                                path.display()
+                            );
+                            false
+                        }
+                    }
+                }
             }
         }
         Kind::Docx => {
             let paras = docx_paragraphs(&bytes[..]);
             match paras {
                 Ok(paras) => {
-                    for term in terms {
-                        for (i, p) in paras.iter().enumerate() {
-                            if let Some(snip) = snippet(p, term) {
-                                hits.push(Hit {
-                                    file: fname.clone(),
-                                    term: term.clone(),
-                                    loc: format!("第{}段", i + 1),
-                                    snippet: snip,
-                                });
+                    hits.extend(hits_via_pages(path, fname, terms, || {
+                        let mut v = Vec::new();
+                        for term in terms {
+                            for (i, p) in paras.iter().enumerate() {
+                                if let Some(snip) = snippet(p, term) {
+                                    v.push(Hit {
+                                        file: fname.to_string(),
+                                        term: term.clone(),
+                                        loc: format!("第{}段", i + 1),
+                                        snippet: snip,
+                                    });
+                                }
                             }
                         }
-                    }
+                        v
+                    }));
                     true
                 }
                 Err(e) => {
@@ -168,31 +189,21 @@ fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
                 }
             }
         }
-        Kind::DocBin => {
-            let text = docbin::doc_text(&bytes[..]);
-            match text {
-                Some(text) => {
-                    for term in terms {
-                        if let Some(snip) = snippet(&text, term) {
-                            hits.push(Hit {
-                                file: fname.clone(),
-                                term: term.clone(),
-                                loc: "全文".to_string(),
-                                snippet: snip,
-                            });
-                        }
-                    }
-                    true
-                }
-                None => {
-                    error!(
-                        "  [搜索] .doc 无法解析 {}: 未找到 WordDocument 流",
-                        path.display()
-                    );
-                    false
-                }
+        Kind::DocBin => match docbin::doc_blocks(&bytes[..]) {
+            Some(blocks) => {
+                hits.extend(hits_via_pages(path, fname, terms, || {
+                    hits_in_blocks(&blocks, fname, terms)
+                }));
+                true
             }
-        }
+            None => {
+                error!(
+                    "  [搜索] .doc 无法解析 {}: 未找到 WordDocument 流",
+                    path.display()
+                );
+                false
+            }
+        },
         Kind::Other => {
             for term in terms {
                 let text = crate::http::decode_text(&bytes[..]);
@@ -225,11 +236,12 @@ fn kind_of(bytes: &[u8], path: &Path) -> Kind {
     }
     if bytes.starts_with(b"PK\x03\x04") {
         if let Ok(z) = zip::ZipArchive::new(Cursor::new(bytes)) {
-            let mut names = z.file_names();
-            if names.any(|n| n == "word/document.xml") {
+            // 注意：Iterator::any 会消费迭代器，同一迭代器不能二次使用，
+            // 否则第二次 .any() 永远为 false，导致 .xlsx 被误判为 Other。
+            if z.file_names().any(|n| n == "word/document.xml") {
                 return Kind::Docx;
             }
-            if names.any(|n| n == "xl/workbook.xml") {
+            if z.file_names().any(|n| n == "xl/workbook.xml") {
                 return Kind::Table;
             }
         }
@@ -324,6 +336,87 @@ fn pdf_pages(bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
         Ok(Err(e)) => Err(format!("PDF 文本提取失败: {e}")),
         Err(_) => Err("PDF 文本提取超时(>120s, 可能为超大/扫描型文件)".to_string()),
     }
+}
+
+/// doc/docx 不存页码，页码由排版引擎渲染决定。用 LibreOffice 把文件转成 PDF，
+/// 再按页提取文本，得到与 Word/WPS 打开时基本一致的页码定位。
+/// 失败（无 soffice/转换失败/超时）返回 None，调用方回退段落定位。
+fn word_pages(path: &Path) -> Option<Vec<String>> {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 每个转换用独立临时目录与独立 LibreOffice profile，避免并行转换互锁。
+    let tmp = std::env::temp_dir().join(format!("sw2pdf-{}-{n}", std::process::id()));
+    fs::create_dir_all(&tmp).ok()?;
+    let stem = path.file_stem()?.to_string_lossy().to_string();
+    let out = tmp.join(format!("{stem}.pdf"));
+    let profile = tmp.join("profile");
+    let profile_url = format!("file://{}", profile.display());
+
+    let mut child = std::process::Command::new("soffice")
+        .arg(format!("-env:UserInstallation={profile_url}"))
+        .args(["--headless", "--convert-to", "pdf", "--outdir"])
+        .arg(&tmp)
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let status = loop {
+        if let Some(st) = child.try_wait().ok()? {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            return None;
+        }
+        thread::sleep(std::time::Duration::from_millis(200));
+    };
+    if !status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return None;
+    }
+    let bytes = fs::read(&out).ok();
+    let _ = fs::remove_dir_all(&tmp);
+    pdf_extract::extract_text_from_mem_by_pages(&bytes?).ok()
+}
+
+/// 优先按页定位 doc/docx 命中；词在页面文本中未命中（渲染/提取差异）时，
+/// 用 `fallback`（段落/块定位）补齐，避免漏检。
+fn hits_via_pages(
+    path: &Path,
+    fname: &str,
+    terms: &[String],
+    fallback: impl Fn() -> Vec<Hit>,
+) -> Vec<Hit> {
+    let Some(pages) = word_pages(path) else {
+        return fallback();
+    };
+    let mut hits = Vec::new();
+    let mut page_terms: Vec<String> = Vec::new();
+    for term in terms {
+        let mut found = false;
+        for (i, page) in pages.iter().enumerate() {
+            if let Some(snip) = snippet(page, term) {
+                hits.push(Hit {
+                    file: fname.to_string(),
+                    term: term.clone(),
+                    loc: format!("第{}页", i + 1),
+                    snippet: snip,
+                });
+                found = true;
+            }
+        }
+        if found {
+            page_terms.push(term.clone());
+        }
+    }
+    for h in fallback() {
+        if !page_terms.contains(&h.term) {
+            hits.push(h);
+        }
+    }
+    hits
 }
 
 fn excel_rows(path: &Path) -> Option<Vec<(String, usize, String)>> {
@@ -421,6 +514,47 @@ fn docx_paragraphs(bytes: &[u8]) -> Result<Vec<String>, String> {
         }
     }
     Ok(paras)
+}
+
+/// 在 OLE 文本块列表里检索关键词：命中记录干净块号（第N段），跨块关键词取起始块。
+fn hits_in_blocks(blocks: &[String], fname: &str, terms: &[String]) -> Vec<Hit> {
+    let text = blocks.join("\n");
+    // 定位只按“干净块”编号：FIB 头/二进制区解出的乱码块不占序号，块号贴近段落。
+    let clean = docbin::clean_indices(blocks);
+    let mut hits = Vec::new();
+    for term in terms {
+        if let Some(snip) = snippet(&text, term) {
+            let loc = block_loc(&text, blocks, term)
+                .and_then(|i| clean.iter().position(|&c| c == i))
+                .map(|ci| format!("第{}段", ci + 1))
+                .unwrap_or_else(|| "全文".to_string());
+            hits.push(Hit {
+                file: fname.to_string(),
+                term: term.clone(),
+                loc,
+                snippet: snip,
+            });
+        }
+    }
+    hits
+}
+
+/// 在“块以换行拼接”的文本里，定位关键词起始所在块的序号；失败返回 None。
+fn block_loc(text: &str, blocks: &[String], term: &str) -> Option<usize> {
+    let stripped: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let t: String = term.chars().filter(|c| !c.is_whitespace()).collect();
+    // find 返回字节偏移，块计数按字符，先转成字符索引再比较
+    let pos = stripped.find(&t)?;
+    let c_pos = stripped[..pos].chars().count();
+    let mut seen = 0usize;
+    for (i, blk) in blocks.iter().enumerate() {
+        let non_ws = blk.chars().filter(|c| !c.is_whitespace()).count();
+        if c_pos < seen + non_ws {
+            return Some(i);
+        }
+        seen += non_ws;
+    }
+    None
 }
 
 fn snippet(text: &str, term: &str) -> Option<String> {
