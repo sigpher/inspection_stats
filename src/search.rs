@@ -1,10 +1,10 @@
 //! 按 config.toml 的 search 词扫描下载目录，结果写入 result.db（SQLite）。
-//! 表格(xlsx/xls)→所在行；文本型 PDF→所在页；OCR 型 PDF/doc/docx→全文/段落（无分页信息）。
+//! 表格(xlsx/xls)→所在行；PDF→所在页；Word(doc/docx)→文本块/段落（无分页信息）。
 
 use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use calamine::{Data, Reader, Xls, Xlsx};
@@ -31,7 +31,7 @@ struct Scanned {
     broken: bool,
 }
 
-pub fn run(terms: &[String], dir: &Path) {
+pub fn run(terms: &[String], dir: &Path, lang: &str) {
     let files = list_files(dir);
     debug!(
         "[扫描顺序] {:?}",
@@ -49,7 +49,7 @@ pub fn run(terms: &[String], dir: &Path) {
     thread::scope(|s| {
         for f in &files {
             s.spawn(|| {
-                let r = scan_file(f, terms);
+                let r = scan_file(f, terms, lang);
                 scanned.lock().unwrap().push(Scanned {
                     file: f.display().to_string(),
                     broken: !r.ok,
@@ -78,12 +78,6 @@ pub fn run(terms: &[String], dir: &Path) {
         let n = hits.iter().filter(|h| &h.term == term).count();
         info!("[搜索] 「{term}」 命中 {n} 处");
     }
-    for h in &hits {
-        info!(
-            "[命中] {} | {} | 「{}」 | {}",
-            h.file, h.loc, h.term, h.snippet
-        );
-    }
 }
 
 struct Out {
@@ -91,7 +85,7 @@ struct Out {
     hits: Vec<Hit>,
 }
 
-fn scan_file(path: &Path, terms: &[String]) -> Out {
+fn scan_file(path: &Path, terms: &[String], lang: &str) -> Out {
     let raw = match fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -108,8 +102,8 @@ fn scan_file(path: &Path, terms: &[String]) -> Out {
     let kind = kind_of(bytes.as_slice(), path);
     let mut hits = Vec::new();
     let ok = match kind {
-        Kind::Pdf => match pdf_text_or_ocr(path, &bytes) {
-            Ok(PdfText::Pages(pages)) => {
+        Kind::Pdf => match pdf_text_or_ocr(path, &bytes, lang) {
+            Ok(pages) => {
                 for term in terms {
                     for (i, page) in pages.iter().enumerate() {
                         if let Some(snip) = snippet(page, term) {
@@ -120,19 +114,6 @@ fn scan_file(path: &Path, terms: &[String]) -> Out {
                                 snippet: snip,
                             });
                         }
-                    }
-                }
-                true
-            }
-            Ok(PdfText::Whole(text)) => {
-                for term in terms {
-                    if let Some(snip) = snippet(&text, term) {
-                        hits.push(Hit {
-                            file: fname.clone(),
-                            term: term.clone(),
-                            loc: "全文".to_string(),
-                            snippet: snip,
-                        });
                     }
                 }
                 true
@@ -285,19 +266,17 @@ fn pdf_needs_ocr(bytes: &Arc<Vec<u8>>) -> Option<bool> {
     res
 }
 
-/// PDF 解析结果：分页文本（pdf-extract）或整篇文本（OCR，无分页信息）。
-enum PdfText {
-    Pages(Vec<String>),
-    Whole(String),
-}
-
 /// 优先用 pdf-extract 取文本；pdf-inspector 判定为扫描件时直接 OCR；
-/// 文本提取失败或文本极少（图片型/混合）时回退到 OCR（mineru-open-api）。
-fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>) -> Result<PdfText, String> {
+/// 文本提取失败或文本极少（图片型/混合）时回退到 OCR。
+fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>, lang: &str) -> Result<Vec<String>, String> {
     let force_ocr = pdf_needs_ocr(bytes);
     if force_ocr == Some(true) {
         info!("[OCR] {} 判定为扫描件，直接 OCR", path.display());
-        return ocr_pdf_result(path);
+        return match ocr::ocr_pdf(path, lang) {
+            Ok(op) if !pdf_text_sparse(&op) => Ok(op),
+            Ok(_) => Err("OCR 未识别出文本（可能缺少对应语言包，或页面纯为图片/空白）".to_string()),
+            Err(e) => Err(e),
+        };
     }
     match pdf_pages(bytes) {
         Ok(pages) => {
@@ -307,32 +286,22 @@ fn pdf_text_or_ocr(path: &Path, bytes: &Arc<Vec<u8>>) -> Result<PdfText, String>
                     "[OCR] {} 判定需 OCR（扫描件/文本极少），尝试识别",
                     path.display()
                 );
-                ocr_pdf_result(path)
+                match ocr::ocr_pdf(path, lang) {
+                    Ok(op) if !pdf_text_sparse(&op) => Ok(op),
+                    Ok(_) => Err(
+                        "OCR 未识别出文本（可能缺少对应语言包，或页面纯为图片/空白）".to_string(),
+                    ),
+                    Err(e) => Err(e),
+                }
             } else {
-                Ok(PdfText::Pages(pages))
+                Ok(pages)
             }
         }
         Err(e) => {
             info!("[OCR] {} 文本提取失败({e})，尝试 OCR", path.display());
-            ocr_pdf_result(path)
+            ocr::ocr_pdf(path, lang)
         }
     }
-}
-
-/// 调 mineru-open-api OCR；结果过稀疏（识别失败/空）视为错误。
-fn ocr_pdf_result(path: &Path) -> Result<PdfText, String> {
-    match ocr::ocr_pdf(path) {
-        Ok(op) if !pdf_text_sparse(&op) => Ok(PdfText::Whole(op.join("\n"))),
-        Ok(_) => {
-            Err("OCR 未识别出文本（mineru-open-api 返回空，文件可能超限或纯图片）".to_string())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-static SPARSE_THRESHOLD: OnceLock<usize> = OnceLock::new();
-fn sparse_threshold() -> usize {
-    *SPARSE_THRESHOLD.get_or_init(crate::config::sparse_threshold)
 }
 
 /// 所有页非空白字符总数低于阈值，视为扫描件/图片型 PDF。
@@ -341,7 +310,7 @@ fn pdf_text_sparse(pages: &[String]) -> bool {
         .iter()
         .map(|p| p.chars().filter(|c| !c.is_whitespace()).count())
         .sum();
-    total < sparse_threshold()
+    total < 50
 }
 
 fn pdf_pages(bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
@@ -350,11 +319,10 @@ fn pdf_pages(bytes: &Arc<Vec<u8>>) -> Result<Vec<String>, String> {
     std::thread::spawn(move || {
         let _ = tx.send(pdf_extract::extract_text_from_mem_by_pages(b.as_slice()));
     });
-    let to = crate::config::pdf_extract_timeout();
-    match rx.recv_timeout(std::time::Duration::from_secs(to)) {
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
         Ok(Ok(pages)) => Ok(pages),
         Ok(Err(e)) => Err(format!("PDF 文本提取失败: {e}")),
-        Err(_) => Err(format!("PDF 文本提取超时(>{to}s, 可能为超大/扫描型文件)")),
+        Err(_) => Err("PDF 文本提取超时(>120s, 可能为超大/扫描型文件)".to_string()),
     }
 }
 
@@ -455,11 +423,6 @@ fn docx_paragraphs(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(paras)
 }
 
-static SNIPPET_LEN: OnceLock<usize> = OnceLock::new();
-fn snippet_len() -> usize {
-    *SNIPPET_LEN.get_or_init(crate::config::snippet_len)
-}
-
 fn snippet(text: &str, term: &str) -> Option<String> {
     // OCR 输出常在汉字间插入空格（如“天 地 壹 号”），且英文可能有空格；
     // 检索时去掉两端空白再匹配，避免扫描件漏检。
@@ -469,24 +432,14 @@ fn snippet(text: &str, term: &str) -> Option<String> {
     let low_term = nterm.to_lowercase();
     let idx = low_text.find(&low_term)?;
     let c_idx = low_text[..idx].chars().count();
-    let term_len = low_term.chars().count();
     let c_total = low_text.chars().count();
-    // 命中词前后各取一段上下文，拼接成约 len 字内的片段（仅两端截断时加省略号）。
-    let len = snippet_len();
-    let before = len / 3;
-    let after = len.saturating_sub(before);
-    let c_start = c_idx.saturating_sub(before);
-    let c_end = (c_idx + term_len + after).min(c_total);
-    let s: String = ntext.chars().skip(c_start).take(c_end - c_start).collect();
-    let mut out = String::new();
-    if c_start > 0 {
-        out.push('…');
+    let c_start = c_idx.saturating_sub(15);
+    let c_end = (c_idx + low_term.chars().count() + 20).min(c_total);
+    let mut s: String = ntext.chars().skip(c_start).take(c_end - c_start).collect();
+    if s.chars().count() > 60 {
+        s = s.chars().take(60).collect::<String>() + "…";
     }
-    out.push_str(&s);
-    if c_end < c_total {
-        out.push('…');
-    }
-    Some(out)
+    Some(format!("“…{s}…”"))
 }
 
 fn list_files(dir: &Path) -> Vec<PathBuf> {
